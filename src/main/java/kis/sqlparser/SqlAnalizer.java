@@ -395,7 +395,7 @@ public class SqlAnalizer {
     }
     
     @FunctionalInterface
-    static interface Records<T>{
+    public static interface Records<T>{
         Optional<T> next();
     }
     
@@ -504,11 +504,9 @@ public class SqlAnalizer {
 
     public static class TablePlan extends QueryPlan{
         Table table;
-        Optional<Transaction> tx;
 
-        public TablePlan(Optional<Transaction> tx, Table table) {
+        public TablePlan( Table table) {
             this.table = table;
-            this.tx = tx;
         }
 
         @Override
@@ -522,14 +520,6 @@ public class SqlAnalizer {
             return () -> {
                 while(ite.hasNext()) {
                     TableTuple tuple = ite.next();
-                    if(tx.isPresent()){
-                        //トランザクションがある
-                        if(!tx.get().tupleAvailable(tuple)) continue;
-                    }else{
-                        //トランザクションがない
-                        if(!tuple.isCommited()) continue;
-                    }
-                    //if(tx.isPresent() && )
                     return Optional.of(tuple);
                 }
                 return Optional.empty();
@@ -542,28 +532,6 @@ public class SqlAnalizer {
         }
     }
 
-    public static class HistoryPlan extends QueryPlan{
-        Optional<Transaction> tx;
-        Table table;
-
-        public HistoryPlan(Optional<Transaction> tx, Table table) {
-            this.table = table;
-            this.tx = tx;
-        }
-
-        @Override
-        List<Column> getColumns() {
-            return table.columns;
-        }
-
-        @Override
-        Records<Tuple> records() {
-            Iterator<TableTuple> ite = table.getModifiedTuples(tx).iterator();
-            return () ->
-                ite.hasNext() ? Optional.of(ite.next()) : Optional.empty();
-        }
-    }
-    
     public static class UnionPlan extends NodePlan{
         QueryPlan secondPlan;
 
@@ -603,6 +571,7 @@ public class SqlAnalizer {
 
         @Override
         Records<Tuple> records() {
+            //タプルと、ソート用値列をまとめる
             List<Pair<Tuple, List<Pair<SqlValue, Boolean>>>> tuples = new ArrayList<>();
             Records<Tuple> rec = from.records();
             Map<Column, Integer> columnIndex = getColumnIndex();
@@ -881,9 +850,7 @@ public class SqlAnalizer {
                 .orElseThrow(() -> 
                         new RuntimeException("table " + from.table.ident + " not found"));
         env.put(from.table.ident, table);
-        QueryPlan primary = new UnionPlan(
-                new TablePlan(ctx.currentTx, table),
-                new HistoryPlan(ctx.currentTx, table));
+        QueryPlan primary = new TablePlan(table);
         
         for(ASTJoin j : from.joins){
             String t = j.table.ident;
@@ -891,9 +858,7 @@ public class SqlAnalizer {
                 new RuntimeException("join table " + t + " not found"));
             env.put(t, tb);
             SqlValue cond = validate(env, j.logic);
-            QueryPlan right = new UnionPlan(
-                    new TablePlan(ctx.currentTx, tb),
-                    new HistoryPlan(ctx.currentTx, tb));
+            QueryPlan right = new TablePlan(tb);
             primary = new JoinPlan(primary, right, cond);
         }
         
@@ -1091,14 +1056,12 @@ public class SqlAnalizer {
             indexes = IntStream.range(0, t.columns.size()).toArray();
         }
 
-        ctx.withTx(tx -> {
-            insert.value.forEach(ro -> {
-                Object[] row = new Object[t.columns.size()];
-                for(int i = 0; i < ro.size(); ++i){
-                    row[indexes[i]] = unwrap(validate(null, ro.get(i))).orElse(null);
-                }
-                t.insert(tx, row);
-            });
+        insert.value.forEach(ro -> {
+            Object[] row = new Object[t.columns.size()];
+            for(int i = 0; i < ro.size(); ++i){
+                row[indexes[i]] = unwrap(validate(null, ro.get(i))).orElse(null);
+            }
+            t.insert(row);
         });
         return insert.value.size();
     }
@@ -1109,7 +1072,7 @@ public class SqlAnalizer {
                         String.format("table %s not found.", del.table.ident)));
         Map<String, Table> env = new HashMap<>();
         env.put(del.table.ident, t);
-        QueryPlan primary = new TablePlan(ctx.currentTx, t);
+        QueryPlan primary = new TablePlan(t);
 
         if(del.where.isPresent()){
             SqlValue cond = del.where.map(a -> validate(env, a)).get();
@@ -1126,7 +1089,7 @@ public class SqlAnalizer {
         for(Optional<Tuple> line; (line = rec.next()).isPresent(); ){
             deletes.add((TableTuple)line.get());
         }
-        ctx.withTx(tx -> t.delete(tx, deletes));
+        t.delete(deletes);
         return deletes.size();
     }
     public static int update(Context ctx, ASTUpdate update){
@@ -1135,7 +1098,7 @@ public class SqlAnalizer {
                         String.format("table %s not found.", update.table.ident)));
         Map<String, Table> env = new HashMap<>();
         env.put(update.table.ident, t);
-        QueryPlan primary = new TablePlan(ctx.currentTx, t);
+        QueryPlan primary = new TablePlan( t);
 
         if(update.where.isPresent()){
             SqlValue cond = update.where.map(a -> validate(env, a)).get();
@@ -1156,21 +1119,19 @@ public class SqlAnalizer {
         Map<Column, Integer> colIdx = primary.getColumnIndex();
         Records<Tuple> rec = primary.records();
         int[] ct = {0};
-        ctx.withTx(tx -> {
-            for(Optional<Tuple> oline; (oline = rec.next()).isPresent(); ){
-                Tuple line = oline.get();
-                List<Optional<?>> copy = new ArrayList<>(line.row);
-                while(copy.size() < t.columns.size()){
-                    copy.add(Optional.empty());
-                }
-
-                values.forEach(me -> {
-                    copy.set(me.getKey(), unwrap(eval(me.getValue(), colIdx, line)));
-                });
-                t.update(tx, line.rid, copy);
-                ++ct[0];
+        for(Optional<Tuple> oline; (oline = rec.next()).isPresent(); ){
+            Tuple line = oline.get();
+            List<Optional<?>> copy = new ArrayList<>(line.row);
+            while(copy.size() < t.columns.size()){
+                copy.add(Optional.empty());
             }
-        });
+
+            values.forEach(me -> {
+                copy.set(me.getKey(), unwrap(eval(me.getValue(), colIdx, line)));
+            });
+                t.update(line.rid, copy);
+            ++ct[0];
+        }
         return ct[0];
     }
     
@@ -1273,7 +1234,6 @@ public class SqlAnalizer {
         ctx.exec("create table shohin(id, name, bunrui_id, price)");
         ctx.exec("create table bunrui(id, name, seisen)");
         
-        ctx.begin();
         ctx.exec("insert into bunrui(id, name, seisen) values" +
                 "(1, '野菜', 1)," +
                 "(2, 'くだもの', 1)," +
@@ -1281,8 +1241,6 @@ public class SqlAnalizer {
                 "(9, '団子', 0)");
         System.out.println("コミット前");
         printResult(ctx2.exec("select * from bunrui"));
-        ctx3.begin();
-        ctx.commit();
         System.out.println("コミット後");
         printResult(ctx2.exec("select * from bunrui"));
         System.out.println("コミット前に始まったトランザクション");
